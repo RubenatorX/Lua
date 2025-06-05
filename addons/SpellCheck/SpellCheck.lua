@@ -26,14 +26,17 @@
 
 _addon.name    = 'SpellCheck'
 _addon.author  = 'Zubis'
-_addon.version = '1.0.2'
+_addon.version = '1.1.0'
 _addon.command = 'SpellCheck'
 
 require('sets')
 require('tables')
 res = require('resources')
-
-require('SpellExceptions')
+res_all_spells = res.spells:filter(function(s)
+    return not s.unlearnable and not table.empty(s.levels) and not s.en:endswith('(UC)')
+end):map(function(s)
+    return {id=s.id, type=s.type, name=s.name}
+end)
 
 --Declare valid spell types
 spell_type = {whm='WhiteMagic',blm='BlackMagic',smn='SummonerPact',nin='Ninjutsu',brd='BardSong',blu='BlueMagic',geo='Geomancy',tru='Trust'}
@@ -47,57 +50,34 @@ windower.register_event('addon command',function (command, ...)
     if command == 'help' or command == 'h' or command == '?' then
         display_help()
     elseif spell_type[command] == nil then
-        display_error(command)
+        display_help(command)
     else
         display_spell_count(command)
     end
 end)
-    
---Display a basic help section
-function display_help()
+
+--Display a basic help section with optional command error
+function display_help(command)
     windower.add_to_chat(7, _addon.name .. ' v.' .. _addon.version)
+    if command then 
+        windower.add_to_chat(7, 'Error: ' .. command .. ' is not a valid option.')
+    end
     windower.add_to_chat(7, 'Usage: //spellcheck whm | blm | smn | nin | brd | blu | geo | tru')
     windower.add_to_chat(7, 'Sample: //spellcheck whm')
-end
-
---Display error based on invalid selection
-function display_error(command)
-    windower.add_to_chat(7, _addon.name .. ' v.' .. _addon.version)
-    windower.add_to_chat(7, 'Error: ' .. command .. ' is not a valid option.')
-    windower.add_to_chat(7, 'Usage: //spellcheck whm | blm | smn | nin | brd | blu | geo | tru')
 end
 
 --Get spells
 function display_spell_count(command)
 
-    missing_spells_len = 0
-    missing_spell_names = {}
+    missing_spells
     
     --Get all, current and missing spells 
-    all_spells = res.spells:type(spell_type[command]):keyset()
-    current_spells = T(windower.ffxi.get_spells()):filter(boolean._true):keyset()   
+    all_spells = res_all_spells:type(spell_type[command]):keyset()
+    current_spells = T(windower.ffxi.get_spells()):filter(true):keyset()   
     
     missing_spells = all_spells - current_spells
-    current_spells = all_spells * current_spells
-        
-    --Add missing spells to table for sorting
-    for spell in missing_spells:it() do
-        --Trust and spells must be processed separately
-        if command == 'tru' then
-            --Only include non Unity trusts
-            if not res.spells[spell].name:endswith('(UC)') then
-                missing_spells_len = missing_spells_len + 1
-                table.insert(missing_spell_names, res.spells[spell].name)
-            end
-        else
-            --Add to missing spell list only if it's a valid spell
-            --And it's not in the spell exception list
-            if not table.empty(res.spells[spell].levels) and spell_exceptions[res.spells[spell].id] == nil then
-                missing_spells_len = missing_spells_len + 1
-                table.insert(missing_spell_names, res.spells[spell].name)
-            end
-        end
-    end
+    missing_spells = res_all_spells:id(set.contains+{missing_spells})
+
     
     --Sort missing spells by name
     table.sort(missing_spell_names)
