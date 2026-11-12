@@ -9,6 +9,7 @@ require('maths')
 require('strings')
 require('functions')
 require('pack')
+require('tries')
 
 local table = require('table')
 
@@ -215,6 +216,7 @@ do
 
         return res, index
     end
+    packets._expand = parse
 
     -- Arguments are:
     --  dir     'incoming' or 'outgoing'
@@ -308,6 +310,63 @@ local make_pack_string = function(field)
     return nil
 end
 
+-- Expansion cache, keyed by the layout's entry tables, the padded data length and the bytes its count_ref fields read.
+local layouts = _libs.tries.new()
+
+local function count_ref_positions(fields)
+    return fields:reduce(function(positions, field)
+        if not field.ref then
+            return positions
+        end
+        if field.count == nil and field.count_ref then
+            positions:append(field.count_ref + 1)
+        end
+        return positions:extend(count_ref_positions(field.ref))
+    end, L{})
+end
+
+local function new_leaf(layout)
+    return {positions = count_ref_positions(layout), by_key = {}}
+end
+
+local function expansion_key(leaf, data)
+    if #leaf.positions == 0 then
+        return #data
+    end
+    local parts = {#data}
+    for i, at in ipairs(leaf.positions) do parts[i + 1] = tostring((data:byte(at))) end
+    return table.concat(parts, ':')
+end
+
+local function new_expansion(layout, data)
+    local fields = packets._expand(layout, data)
+    return {
+        n = #fields,
+        pack = fields:map(make_pack_string):concat(),
+        labels = fields:map(table.get-{'label'}),
+        -- false, not nil: a nil read from a list goes through its __index on every parse
+        encs = fields:map(function(field) return field.enc or false end),
+        aliases = fields:filter(function(field) return field.alias ~= nil end):map(function(field)
+            return L{field.alias, field.label}
+        end):flatten(),
+    }
+end
+
+local function cached_expansion(layout, data)
+    local leaf = layouts:get(layout, new_leaf)
+    local key = expansion_key(leaf, data)
+    local expansion = leaf.by_key[key]
+    if expansion == nil then
+        expansion = new_expansion(layout, data)
+        leaf.by_key[key] = expansion
+    end
+    return expansion
+end
+
+function packets.clear_cache()
+    layouts:clear()
+end
+
 -- Constructor for packets (both injected and parsed).
 -- If data is a string it parses an existing packet, otherwise it will create
 -- a new packet table for injection. In that case, data can ba an optional
@@ -353,23 +412,27 @@ function packets.parse(dir, data)
         _raw = data,
     }, __meta.Packet)
 
-    local fields = packets.fields(res)
-    if not fields or #fields == 0 then
+    local layout = packets.raw_fields[dir][id]
+    if type(layout) == 'function' then
+        layout = layout(data)
+    end
+    if not layout then
         return res
     end
 
-    local pack_str = fields:map(make_pack_string):concat()
-
-    for field in fields:it() do
-        if field.alias then
-            res._aliases[field.alias] = field.label
-        end
+    local expansion = cached_expansion(layout, data)
+    if expansion.n == 0 then
+        return res
     end
 
-    for key, val in ipairs({res._raw:sub(5):unpack(pack_str)}) do
-        local field = fields[key]
-        if field then
-            res[field.label] = field.enc and field.enc.decode(val) or val
+    table.dict(res._aliases, unpack(expansion.aliases))
+
+    local labels, encs = expansion.labels, expansion.encs
+    for key, val in ipairs({res._raw:unpack(expansion.pack, 5)}) do
+        local label = labels[key]
+        if label then
+            local enc = encs[key]
+            res[label] = enc and enc.decode(val) or val
         end
     end
 

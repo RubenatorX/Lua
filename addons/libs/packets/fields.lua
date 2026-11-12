@@ -649,16 +649,32 @@ func.outgoing[0x051].base = L{
     {ctype='unsigned char[3]',  label='_unknown1'},                             -- 05   Same as _unknown1 in outgoing 0x052
 }
 
--- Equipset
-fields.outgoing[0x051] = function(data, count)
-    count = count or data:byte(5)
+-- Memoizes a layout function per count (the argument, else the byte at offset), so packets.parse's cache hits. The
+-- returned lists are shared: don't modify them.
+local function memoized_by_count(offset, build)
+    local layouts = {}
+    return function(data, count)
+        count = count or data:byte(offset + 1)
+        if count == nil then
+            return build(count)
+        end
+        local layout = layouts[count]
+        if not layout then
+            layout = build(count)
+            layouts[count] = layout
+        end
+        return layout
+    end
+end
 
+-- Equipset
+fields.outgoing[0x051] = memoized_by_count(0x04, function(count)
     return func.outgoing[0x051].base + L{
         -- Only the number given in Count will be properly populated, the rest is junk
         {ref=types.equipset,        count=count},                                   -- 08
         {ctype=('data[%u]'):format((16 - count) * 4), label='_junk1'},              -- 08 + 4 * count
     }
-end
+end)
 
 types.equipset_build = L{
     {ctype='boolbit',           label='Active'},                                -- 00
@@ -1783,25 +1799,36 @@ do
     local add_effect_offset = 85
     local add_effect_size = 37
     local spike_effect_size = 34
-    local add_action = function(data, pos)
-        local action = L{}
-        action:extend(types.action_base)
-
-        action:extend(types.add_effect_base)
+    local skip_action = function(data, pos)
         pos = pos + add_effect_offset
         local has_add_effect = extract(data, pos, 1) == 1
         pos = pos + 1
         if has_add_effect then
-            action:extend(types.add_effect_body)
             pos = pos + add_effect_size
         end
 
-        action:extend(types.spike_effect_base)
         local has_spike_effect = extract(data, pos, 1) == 1
         pos = pos + 1
         if has_spike_effect then
-            action:extend(types.spike_effect_body)
             pos = pos + spike_effect_size
+        end
+
+        return pos, has_add_effect, has_spike_effect
+    end
+
+    local add_action = function(data, pos)
+        local action = L{}
+        local has_add_effect, has_spike_effect
+        pos, has_add_effect, has_spike_effect = skip_action(data, pos)
+
+        action:extend(types.action_base)
+        action:extend(types.add_effect_base)
+        if has_add_effect then
+            action:extend(types.add_effect_body)
+        end
+        action:extend(types.spike_effect_base)
+        if has_spike_effect then
+            action:extend(types.spike_effect_body)
         end
 
         return action, pos
@@ -1831,7 +1858,7 @@ do
 
     local target_count_offset = 72
     local first_target_offset = 150
-    fields.incoming[0x028] = function(data)
+    local build = function(data)
         local result = types.base:copy()
         local target_count = extract(data, target_count_offset, 10)
         local pos = first_target_offset
@@ -1847,6 +1874,36 @@ do
         end
 
         return result
+    end
+
+    -- Memoized by shape (target count, action counts, effect flags), so packets.parse's cache hits.
+    local layouts, layout_count, max_layouts = {}, 0, 256
+    fields.incoming[0x028] = function(data)
+        local target_count = extract(data, target_count_offset, 10)
+        local shape = {target_count}
+        local pos = first_target_offset
+        for _ = 1, target_count do
+            pos = pos + action_count_offset
+            local action_count = extract(data, pos, 4)
+            pos = pos + 4
+            shape[#shape + 1] = '|'
+            for _ = 1, action_count do
+                local has_add_effect, has_spike_effect
+                pos, has_add_effect, has_spike_effect = skip_action(data, pos)
+                shape[#shape + 1] = (has_add_effect and 'a' or '-') .. (has_spike_effect and 's' or '-')
+            end
+        end
+        local key = table.concat(shape)
+        local layout = layouts[key]
+        if not layout then
+            if layout_count >= max_layouts then
+                layouts, layout_count = {}, 0
+            end
+            layout = build(data)
+            layouts[key] = layout
+            layout_count = layout_count + 1
+        end
+        return layout
     end
 end
 
@@ -2838,8 +2895,9 @@ enums.quest_mission_log = {
 -- Quests will remain in your 'current' list after they are completed unless they are repeatable.
 
 func.incoming[0x056] = {}
+local quest_flags_fallback = L{{ctype='data[32]', label='Quest Flags'}}
 fields.incoming[0x056] = function (data, type)
-    return (func.incoming[0x056][type or data and data:unpack('H',0x25)] or L{{ctype='data[32]', label='Quest Flags'}}) + func.incoming[0x056].type
+    return (func.incoming[0x056][type or data and data:unpack('H',0x25)] or quest_flags_fallback) + func.incoming[0x056].type
 end
 
 func.incoming[0x056].type = L{
@@ -3426,14 +3484,14 @@ types.merit_entry = L{
 }
 
 -- Merits
-fields.incoming[0x08C] = function(data, merits)
+fields.incoming[0x08C] = memoized_by_count(0x04, function(merits)
     return L{
         {ctype='unsigned char', label='Count'},                                 -- 04   Number of merits entries in this packet (possibly a short, although it wouldn't make sense)
         {ctype='data[3]',       label='_unknown1'},                             -- 05   Always 00 0F 01?
-        {ref=types.merit_entry, count=merits or data:byte(5)},                  -- 08
+        {ref=types.merit_entry, count=merits},                                  -- 08
         {ctype='unsigned int',  label='_unknown2',          const=0x00000000},  ---04
     }
-end
+end)
 
 types.job_point = L{
     {ctype='unsigned short',    label='Job Point ID'},                          -- 00   32 potential values for every job, which means you could decompose this into a value bitpacked with job ID if you wanted
@@ -3986,16 +4044,14 @@ func.incoming[0x117].base = L{
 }
 
 -- Equipset
-fields.incoming[0x117] = function(data, count)
-    count = count or data:byte(5)
-
+fields.incoming[0x117] = memoized_by_count(0x04, function(count)
     return func.incoming[0x117].base + L{
         -- Only the number given in Count will be properly populated, the rest is junk
         {ref=types.equipset,        count=count},                                   -- 08
         {ctype=('data[%u]'):format((16 - count) * 4), label='_junk1'},              -- 08 + 4 * count
         {ref=types.equipset,        lookup={res.slots, 0x00},   count=0x10},        -- 48
     }
-end
+end)
 
 -- Currency Info (Currencies2)
 fields.incoming[0x118] = L{
